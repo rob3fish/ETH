@@ -23,8 +23,8 @@ clean-targets:
   - "target"
   - "dbt_packages"
 
-flags:
-  fail_fast: true
+# flags:
+#   fail_fast: true
 
 seeds:
   +database: seeds
