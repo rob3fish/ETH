@@ -1,34 +1,46 @@
 name: dbt CI
 
+# Run this workflow whenever a PR is opened targeting master
 on:
   pull_request:
     branches:
       - master
-      - dev
 
 jobs:
   dbt-run:
+    # Spin up a fresh Ubuntu virtual machine on GitHub's servers
     runs-on: ubuntu-latest
+    # DBT_ETH is the GitHub environment where your secrets are stored
     environment: DBT_ETH
 
+    # Make your Snowflake private key available to all steps as an environment variable
     env:
       DBT_PRIVATE_KEY: ${{ secrets.DBT_PRIVATE_KEY }}
       DBT_PRIVATE_KEY_PATH: /home/runner/.dbt/rsa_key.p8
+      DBT_SNOWFLAKE_ACCOUNT: ${{ secrets.DBT_SNOWFLAKE_ACCOUNT }}
+      DBT_SNOWFLAKE_ROLE: ${{ secrets.DBT_SNOWFLAKE_ROLE }}
+      DBT_SNOWFLAKE_USER: ${{ secrets.DBT_SNOWFLAKE_USER }}
 
     steps:
+      # Download your code onto the VM so the rest of the steps can use it
       - name: Checkout repo
         uses: actions/checkout@v3
 
+      # Install Python 3.12.10 on the VM
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
           python-version: "3.12.10"
 
+      # Install dbt-core and dbt-snowflake via pip
       - name: Install dbt
         run: |
           python -m pip install --upgrade pip
           pip install dbt-core==1.9.4 dbt-snowflake==1.9.4
 
+      # Create ~/.dbt/ folder, copy profiles.yml from the repo into it,
+      # write the private key secret to a .p8 file on disk,
+      # and lock down the file so only the current user can read it (required by Snowflake)
       - name: Set up dbt profile + private key
         run: |
           mkdir -p ~/.dbt
@@ -36,11 +48,17 @@ jobs:
           echo "$DBT_PRIVATE_KEY" > ~/.dbt/rsa_key.p8
           chmod 600 ~/.dbt/rsa_key.p8
 
+      # Install any dbt packages defined in packages.yml
       - name: Install dbt deps
         run: dbt deps
 
+      # Test the Snowflake connection before doing any real work.
+      # If this fails, it's a connection issue, not a model issue
       - name: Run dbt debug
         run: dbt debug --target ci
 
+      # Compile and execute all models, seeds, and tests against
+      # the CI environment in Snowflake.
+      # --full-refresh forces incremental models to rebuild from scratch
       - name: Run dbt
-        run: dbt build --target ci  --full-refresh
+        run: dbt build --target ci --full-refresh
