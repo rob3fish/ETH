@@ -1,0 +1,75 @@
+# ============================================================
+# PR Schema Cleanup Workflow
+# ============================================================
+# The dbt CI workflow creates a dedicated Snowflake schema for
+# each pull request (pr_<number>). These schemas are never
+# automatically dropped, so without this workflow they would
+# accumulate indefinitely and incur unnecessary storage costs.
+#
+# This workflow runs a dbt macro daily that drops any PR schemas
+# in the CI database that are older than a given age threshold.
+# It can also be triggered manually for an immediate cleanup.
+
+name: Cleanup PR Schemas
+
+on:
+  schedule:
+    - cron: "0 2 * * *"  # Runs every day at 02:00 UTC — off-peak to avoid interfering with active CI jobs
+  workflow_dispatch:       # Also allows a manual run from the GitHub Actions tab (e.g. for an immediate tidy-up)
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    environment: DBT_ETH
+
+    env:
+      # ── Snowflake key-pair auth ──────────────────────────────
+      DBT_PRIVATE_KEY: ${{ secrets.DBT_PRIVATE_KEY }}
+      DBT_PRIVATE_KEY_PATH: /home/runner/.dbt/rsa_key.p8
+      DBT_SNOWFLAKE_IDENTIFIER: ${{ secrets.DBT_SNOWFLAKE_IDENTIFIER }}
+      DBT_SNOWFLAKE_ROLE: ${{ secrets.DBT_SNOWFLAKE_ROLE }}
+      DBT_SNOWFLAKE_USER: ${{ secrets.DBT_SNOWFLAKE_USER }}
+      # ── Schema override ──────────────────────────────────────
+      # The cleanup macro connects to the CI database, not a PR-specific
+      # schema, so we point dbt at PUBLIC as a neutral landing schema.
+      # The macro itself handles which schemas to drop — this value
+      # just satisfies the profile's requirement for a default schema.
+      DBT_SCHEMA: PUBLIC
+
+    steps:
+      # ── 1–4. Standard setup ──────────────────────────────────
+      # (checkout, Python, dbt install, and auth are identical to
+      # the other workflows — see comments in the prod workflow)
+      - name: Checkout repo
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.12.10"
+
+      - name: Install dbt
+        run: pip install dbt-core==1.9.4 dbt-snowflake==1.9.4
+
+      - name: Set up dbt profile + private key
+        run: |
+          mkdir -p ~/.dbt
+          cp .dbt/profiles.yml ~/.dbt/profiles.yml
+          echo "$DBT_PRIVATE_KEY" > ~/.dbt/rsa_key.p8
+          chmod 600 ~/.dbt/rsa_key.p8
+
+      # ── 5. Schema cleanup ────────────────────────────────────
+      - name: Cleanup
+        run: |
+          # Calls the pr_schema_cleanup macro directly via run-operation.
+          # This macro queries Snowflake's information schema to find PR
+          # schemas (typically named pr_<number>) and drops any that
+          # exceed the specified age threshold.
+          #
+          # Arguments:
+          #   database_to_clean: 'CI'  — only schemas inside the CI database
+          #                              are considered, so prod is never touched
+          #   age_in_days: -1          — -1 means drop ALL pr_ schemas regardless
+          #                              of age; change to e.g. 7 to keep schemas
+          #                              from PRs that were active in the last week
+          dbt run-operation pr_schema_cleanup --target ci --args "{'database_to_clean': 'CI','age_in_days': -1}"
