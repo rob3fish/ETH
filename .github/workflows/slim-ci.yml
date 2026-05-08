@@ -1,29 +1,49 @@
+# ============================================================
+# dbt CI Workflow
+# ============================================================
+# Runs a slim, state-aware dbt build on every pull request
+# targeting master. Rather than rebuilding everything, it uses
+# dbt's --defer + --state flags to only build models that have
+# changed (and their downstream dependents), keeping CI fast
+# and Snowflake compute costs low.
+#
+# Isolation: each PR gets its own Snowflake schema (pr_<number>)
+# so CI runs never touch the production dataset.
+
 name: dbt CI
 
 on:
   pull_request:
     branches:
-      - master
+      - master   # Triggers on any PR opened or updated against master
 
 jobs:
   dbt-run:
     runs-on: ubuntu-latest
-    environment: DBT_ETH
+    environment: DBT_ETH   # GitHub environment gate — inherits the same secrets as prod
 
     env:
+      # ── Snowflake key-pair auth (same credentials as prod) ──
       DBT_PRIVATE_KEY: ${{ secrets.DBT_PRIVATE_KEY }}
       DBT_PRIVATE_KEY_PATH: /home/runner/.dbt/rsa_key.p8
       DBT_SNOWFLAKE_ACCOUNT: ${{ secrets.DBT_SNOWFLAKE_ACCOUNT }}
       DBT_SNOWFLAKE_ROLE: ${{ secrets.DBT_SNOWFLAKE_ROLE }}
       DBT_SNOWFLAKE_USER: ${{ secrets.DBT_SNOWFLAKE_USER }}
+      # ── CI isolation ────────────────────────────────────────
+      # Each PR writes into its own schema (e.g. pr_42), so runs
+      # are fully isolated from prod and from other open PRs.
+      # profiles.yml should reference this env var for the ci target.
       DBT_SCHEMA: pr_${{ github.event.pull_request.number }}
 
     steps:
+      # ── 1. Source code ──────────────────────────────────────
       - name: Checkout repo
         uses: actions/checkout@v3
         with:
-          fetch-depth: 0   # needed so we can access master too
+          fetch-depth: 0   # Full history required so we can switch to the master branch below to generate the baseline manifest
 
+      # ── 2–4. Python, dbt install, auth setup ────────────────
+      # (identical to the prod workflow — see comments there)
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
@@ -41,33 +61,63 @@ jobs:
           echo "$DBT_PRIVATE_KEY" > ~/.dbt/rsa_key.p8
           chmod 600 ~/.dbt/rsa_key.p8
 
+      # ── 5. Dependency install & connection check ─────────────
       - name: Install dbt deps
+        # Installs packages from packages.yml against the PR branch code
         run: dbt deps
 
       - name: Run dbt debug
+        # Verifies the Snowflake connection and dbt profile are valid before
+        # doing any real work — fails fast if credentials or config are wrong
         run: dbt debug --target ci
 
+      # ── 6. Baseline manifest (state comparison anchor) ───────
       - name: Create state manifest from master
         run: |
+          # Temporarily switch to master to compile a manifest that represents
+          # the current production state. This is the "before" snapshot that
+          # dbt's --state flag will diff the PR branch against.
           git checkout master
-          dbt deps
-          dbt parse --target prod
+          dbt deps                          # Ensure master's packages are installed
+          dbt parse --target prod           # Compile master's project into target/manifest.json
+                                            # (parse is compile without executing SQL — fast and cheap)
           mkdir -p state
-          cp target/manifest.json state/manifest.json
-          git checkout -
+          cp target/manifest.json state/manifest.json   # Stash the manifest in ./state/
+          git checkout -                    # Return to the PR branch
 
-      # ---- Clone incrementals first (so is_incremental() is true) ----
+      # ── 7. Clone incrementals ────────────────────────────────
       - name: Clone impacted incremental models into PR schema
         run: |
+          # Before running the slim build, clone any incremental models that are
+          # modified (or downstream of a modification) into the PR schema.
+          #
+          # Why: dbt's is_incremental() macro returns true only when the target
+          # table already exists. Cloning the prod table into the PR schema first
+          # ensures incremental logic is exercised correctly during the build step,
+          # rather than falling back to a full-refresh.
+          #
+          # Selector breakdown:
+          #   state:modified+          — models changed in this PR and all their descendants
+          #   config.materialized:incremental — narrow to incremental models only
+          #   state:old                — must already exist in prod (i.e. not brand-new models)
           dbt clone \
             --target ci \
             --state ./state \
             --defer \
             --select "state:modified+,config.materialized:incremental,state:old"
 
-      # ---- Then slim build ----
+      # ── 8. Slim build ────────────────────────────────────────
       - name: Slim build (modified + downstream)
         run: |
+          # Core CI step: build only what has changed in this PR plus downstream dependents.
+          #
+          # --defer:  for any model NOT in the selection set, resolve refs against
+          #           the prod schema instead of the PR schema — avoids rebuilding
+          #           unchanged upstream dependencies from scratch.
+          # --state:  points to the master manifest generated above so dbt knows
+          #           which models are "modified" relative to production.
+          # state:modified+: the + suffix includes all downstream nodes, ensuring
+          #           we catch any breakage introduced by the changes.
           dbt build \
             --target ci \
             --state ./state \

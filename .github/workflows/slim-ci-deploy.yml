@@ -1,0 +1,87 @@
+# ============================================================
+# dbt Production Deployment Workflow
+# ============================================================
+# Runs the full dbt build pipeline against the production
+# Snowflake environment whenever code is merged to master.
+# Can also be triggered manually via the GitHub Actions UI.
+
+name: dbt prod Deploy
+
+on:
+  push:
+    branches: [ "master" ]   # Automatically triggered on merge to master (i.e. after a PR is approved and merged)
+  workflow_dispatch:         # Also allows manual runs from the GitHub Actions tab
+
+# Prevent multiple deployments running simultaneously.
+# If a new push arrives while a deploy is in progress, it will
+# queue rather than cancel the running job (cancel-in-progress: false).
+concurrency:
+  group: dbt-prod
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: DBT_ETH   # GitHub environment gate — may require manual approval depending on repo settings
+
+    # Snowflake connection credentials injected from GitHub Secrets.
+    # These are referenced in the dbt profiles.yml to authenticate
+    # with Snowflake using key-pair (RSA) authentication.
+    env:
+      DBT_PRIVATE_KEY: ${{ secrets.DBT_PRIVATE_KEY }}           # Raw PEM content of the RSA private key
+      DBT_PRIVATE_KEY_PATH: /home/runner/.dbt/rsa_key.p8        # Where the key file will be written on the runner
+      DBT_SNOWFLAKE_ACCOUNT: ${{ secrets.DBT_SNOWFLAKE_ACCOUNT }} # Snowflake account identifier (e.g. xy12345.eu-west-1)
+      DBT_SNOWFLAKE_ROLE: ${{ secrets.DBT_SNOWFLAKE_ROLE }}     # Snowflake role assumed during the run
+      DBT_SNOWFLAKE_USER: ${{ secrets.DBT_SNOWFLAKE_USER }}     # Snowflake user that owns the key pair
+
+    steps:
+      # ── 1. Source code ──────────────────────────────────────
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # Full git history is fetched; useful if any dbt macros or scripts inspect git metadata
+
+      # ── 2. Python runtime ───────────────────────────────────
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.12.10"   # Pin to an exact version for reproducible installs
+
+      # ── 3. dbt installation ─────────────────────────────────
+      - name: Install dbt
+        run: |
+          python -m pip install --upgrade pip
+          # Install pinned versions of dbt-core and the Snowflake adapter together
+          # to guarantee compatibility between the two packages.
+          pip install dbt-core==1.9.4 dbt-snowflake==1.9.4
+
+      # ── 4. Authentication setup ─────────────────────────────
+      - name: Set up dbt profile + private key
+        run: |
+          mkdir -p ~/.dbt
+          # Copy the project's profiles.yml into the location dbt expects by default
+          cp .dbt/profiles.yml ~/.dbt/profiles.yml
+          # Write the RSA private key from the secret into a file so dbt can reference it
+          echo "$DBT_PRIVATE_KEY" > ~/.dbt/rsa_key.p8
+          # Restrict key file permissions to the owner only (required by Snowflake's key-pair auth)
+          chmod 600 ~/.dbt/rsa_key.p8
+
+      # ── 5. dbt pipeline ─────────────────────────────────────
+
+      - name: dbt deps
+        # Download and install all packages declared in packages.yml
+        run: dbt deps --target prod
+
+      - name: dbt seed
+        # Load static CSV files from the /seeds directory into Snowflake as tables
+        run: dbt seed --target prod
+
+      - name: dbt compile
+        # Resolve all Jinja/SQL templating and validate model references without
+        # executing anything — acts as a pre-flight check before the full build
+        run: dbt compile --target prod
+
+      - name: dbt build (prod)
+        # Run the complete pipeline: execute models (run), tests, snapshots, and seeds
+        # in dependency order against the production target
+        run: dbt build --target prod
