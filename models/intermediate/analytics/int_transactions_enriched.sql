@@ -18,6 +18,7 @@ WITH token_transfer_aggs AS (
     t.receipt_contract_address,
     t.input,
     tt.token_transfer_count,
+    1 AS new_field,
     CASE WHEN t.receipt_contract_address != '' THEN 'contract_creation'
         WHEN tt.transaction_hash IS NOT NULL THEN 'token_transfer'
         WHEN t.input = '0x' AND t.value > 0 THEN 'plain_eth_transfer'
