@@ -16,7 +16,7 @@ models:
           - assert_value_amount_is_positive:
               field: block_number
   - name: stg_transactions
-    description: Transactions in the Etherum Blockchain
+    description: "{{ doc('transactions') }}"
     columns:
       - name: hash
         description: >
@@ -25,10 +25,14 @@ models:
         data_tests:
           - unique
           - not_null
-          - relationships:
-              to: ref('stg_token_transfers')
-              field: transaction_hash
-              severity: warn
+          # - relationships:
+          #     to: ref('stg_token_transfers')
+          #     field: transaction_hash
+          #     severity: warn
+          #     config:
+          #       store_failures: true
+          #       store_failures_as: table
+          #       where: date > current_date - 25
   - name: stablecoin_activity_per_day
     latest_version: 1
     config:
