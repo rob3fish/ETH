@@ -13,4 +13,8 @@ sources:
       - name: contracts_clone
         # identifier: cnt
       - name: transactions
+        columns:
+          - name: hash
+            data_tests:
+              - unique
       - name: token_transfers
